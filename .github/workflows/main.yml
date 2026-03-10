@@ -6,11 +6,19 @@ on:
       html_file:
         description: "Ruta del HTML dentro del repo"
         required: true
-        default: "html/Editar Tema_ INTENSIVOS CIAC _ CIAC _ AULA USM.html"
+        default: "html/curso_exportado.html"
       output_dir:
         description: "Carpeta de salida"
         required: true
         default: "output"
+      delay:
+        description: "Delay entre requests en segundos"
+        required: true
+        default: "0.4"
+      only_pdf:
+        description: "Descargar solo PDFs directos (true/false)"
+        required: true
+        default: "false"
 
 permissions:
   contents: read
@@ -18,52 +26,62 @@ permissions:
 jobs:
   backup-pdfs:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
       - name: Checkout del repositorio
         uses: actions/checkout@v4
 
-      - name: Configurar Python
+      - name: Configurar Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Instalar dependencias
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install -r requirements.txt
 
-      - name: Validar secretos requeridos
+      - name: Validar secret y archivos de entrada
         env:
           MOODLE_COOKIES: ${{ secrets.MOODLE_COOKIES }}
         run: |
-          if [ -z "$MOODLE_COOKIES" ]; then
-            echo "Falta el secret MOODLE_COOKIES"
+          set -euo pipefail
+          if [ -z "${MOODLE_COOKIES:-}" ]; then
+            echo "ERROR: Falta el secret MOODLE_COOKIES" >&2
             exit 1
           fi
           if [ ! -f "${{ github.event.inputs.html_file }}" ]; then
-            echo "No existe el HTML indicado: ${{ github.event.inputs.html_file }}"
+            echo "ERROR: No existe el HTML indicado: ${{ github.event.inputs.html_file }}" >&2
             exit 1
           fi
           if [ ! -f "scripts/download_moodle_pdfs.py" ]; then
-            echo "Falta scripts/download_moodle_pdfs.py"
+            echo "ERROR: Falta scripts/download_moodle_pdfs.py" >&2
             exit 1
           fi
 
-      - name: Ejecutar descarga
+      - name: Ejecutar respaldo
         env:
           MOODLE_COOKIES: ${{ secrets.MOODLE_COOKIES }}
         run: |
+          set -euo pipefail
           mkdir -p "${{ github.event.inputs.output_dir }}"
+          EXTRA=""
+          if [ "${{ github.event.inputs.only_pdf }}" = "true" ]; then
+            EXTRA="--only-pdf"
+          fi
+
           python scripts/download_moodle_pdfs.py \
             --html "${{ github.event.inputs.html_file }}" \
-            --out "${{ github.event.inputs.output_dir }}"
+            --out "${{ github.event.inputs.output_dir }}" \
+            --delay "${{ github.event.inputs.delay }}" \
+            --max-workers 6 \
+            ${EXTRA}
 
-      - name: Comprimir respaldo
+      - name: Comprimir salida
         run: |
-          cd "${{ github.event.inputs.output_dir }}"
-          zip -r ../respaldo_moodle.zip .
+          set -euo pipefail
+          zip -r respaldo_moodle.zip "${{ github.event.inputs.output_dir }}"
 
       - name: Subir ZIP como artifact
         uses: actions/upload-artifact@v4
@@ -72,9 +90,9 @@ jobs:
           path: respaldo_moodle.zip
           if-no-files-found: error
 
-      - name: Subir carpeta de salida como artifact
+      - name: Subir carpeta output como artifact
         uses: actions/upload-artifact@v4
         with:
-          name: respaldo-moodle-folder
+          name: respaldo-moodle-output
           path: ${{ github.event.inputs.output_dir }}
-          if-no-files-found: warn
+          if-no-files-found: error
