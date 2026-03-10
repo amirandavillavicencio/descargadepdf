@@ -1,72 +1,81 @@
-# descargadepdf
+# descargadepdf (modo local)
 
-Respaldo automático de materiales de Moodle/Aula USM a partir de un HTML exportado del curso, ejecutado en GitHub Actions usando cookies de sesión en un secret.
+Este proyecto está preparado para probar **localmente** (Windows o Linux) la descarga de PDFs desde Moodle/Aula USM usando únicamente cookies frescas exportadas de una sesión iniciada.
 
-## Qué hace
-- Lee un HTML exportado desde Moodle.
-- Extrae y clasifica enlaces (`resource/view`, `folder/view`, `url/view`, `pluginfile`, PDFs directos, etc.).
-- Resuelve redirecciones con `requests.Session` usando `MOODLE_COOKIES`.
-- Descarga PDFs reales (directos o encontrados dentro de páginas intermedias).
-- Evita duplicados por URL final, hash SHA-256 y nombre+tamaño.
-- Genera trazabilidad en CSV/JSON.
-- Empaqueta el resultado en ZIP como artifact del workflow.
+## Requisitos
 
-## Estructura del repositorio
-- `scripts/download_moodle_pdfs.py`: script principal CLI.
-- `.github/workflows/main.yml`: workflow manual (`workflow_dispatch`).
-- `requirements.txt`: dependencias Python.
-- `output/` (generado en ejecución):
-  - `pdfs/`
-  - `logs/download_log.csv`
-  - `logs/failed_urls.csv`
-  - `logs/download_summary.json`
+- Python 3.10+
+- Archivo de cookies Netscape actualizado (por ejemplo `aula.usm.cl_cookies.txt`)
+- Dependencias:
 
-## Secret requerido
-Crear secret del repositorio:
-- **Nombre:** `MOODLE_COOKIES`
-- **Valor:** cookies válidas de sesión Moodle en formato Netscape `cookies.txt` o formato `name=value; name2=value2`.
-
-> No publiques tus cookies en commits ni en issues.
-
-## Cómo usar en GitHub Actions
-1. Sube al repo el HTML exportado del curso (por ejemplo: `html/curso_exportado.html`).
-2. Ve a **Actions** → **Respaldo Moodle PDFs** → **Run workflow**.
-3. Completa inputs:
-   - `html_file`: ruta del HTML dentro del repo.
-   - `output_dir`: carpeta de salida (ej. `output`).
-   - `delay`: segundos entre requests (ej. `0.4`).
-   - `only_pdf`: `true` o `false`.
-4. Ejecuta.
-5. Descarga artifacts al finalizar:
-   - `respaldo-moodle-zip`
-   - `respaldo-moodle-output`
-
-## Uso local (opcional)
 ```bash
-python3.11 -m venv .venv
-source .venv/bin/activate
 pip install -r requirements.txt
-
-export MOODLE_COOKIES="(cookies)"
-python scripts/download_moodle_pdfs.py \
-  --html html/curso_exportado.html \
-  --out output \
-  --delay 0.4 \
-  --max-workers 6
 ```
 
-Argumentos disponibles:
-- `--html` (requerido)
-- `--out` (requerido)
-- `--max-workers` (opcional)
-- `--delay` (opcional)
-- `--only-pdf` (opcional)
-- `--base-url` (opcional)
-- `--verbose` (opcional)
+## Archivos clave
 
-## Limitaciones importantes
-- GitHub Actions **no puede leer** cookies locales del navegador del usuario.
-- La autenticación depende totalmente de `MOODLE_COOKIES` válidas.
-- Si la sesión expira, la descarga puede fallar.
-- Algunos recursos externos pueden no ser descargables.
-- No todo enlace de Moodle corresponde a un PDF.
+- `scripts/download_moodle_pdfs.py`: script principal.
+- `scripts/run_local_example.sh`: ejemplo de ejecución local.
+- `aula.usm.cl_cookies.txt`: ejemplo/plantilla de cookies Netscape.
+
+## Uso local (Linux/macOS)
+
+```bash
+python scripts/download_moodle_pdfs.py \
+  --url "https://aula.usm.cl/course/view.php?id=4401&section=23#tabs-tree-start" \
+  --cookies "aula.usm.cl_cookies.txt" \
+  --out "output"
+```
+
+También puedes usar:
+
+```bash
+bash scripts/run_local_example.sh
+```
+
+## Uso local (Windows PowerShell)
+
+```powershell
+python .\scripts\download_moodle_pdfs.py --url "https://aula.usm.cl/course/view.php?id=4401&section=23#tabs-tree-start" --cookies "aula.usm.cl_cookies.txt" --out "output"
+```
+
+## Qué valida el script
+
+1. Carga cookies en formato Netscape desde `--cookies`.
+2. Abre la URL autenticada (`--url`) y detecta claramente si ocurrió:
+   - redirección a `/login/index.php`
+   - redirección a `/auth/oauth2/login.php`
+   - HTML de login en lugar del curso
+3. Procesa enlaces tipo:
+   - `mod/resource/view.php`
+   - `mod/folder/view.php`
+   - `mod/url/view.php`
+   - `pluginfile.php`
+4. Si recibe HTML, busca dentro enlaces PDF reales antes de marcar error.
+5. Evita duplicados por hash SHA-256.
+
+## Logs y salida
+
+Con `--out output`, se generan:
+
+- `output/pdfs/` → PDFs descargados
+- `output/logs/download_log.csv`
+- `output/logs/failed_urls.csv`
+- `output/logs/summary.json`
+
+Además, por cada enlace procesado se imprime en consola:
+
+- `url original`
+- `tipo detectado`
+- `http_status`
+- `final_url`
+- `content_type`
+- `reason`
+
+## Notas importantes
+
+- No usa Selenium.
+- No usa navegador automatizado.
+- No usa login Microsoft automático.
+- No usa usuario/contraseña.
+- Depende 100% de cookies frescas válidas.
