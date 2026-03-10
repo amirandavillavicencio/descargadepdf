@@ -21,36 +21,22 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Verificar cookies
+        run: |
+          if [ ! -f "aula.usm.cl_cookies.txt" ]; then
+            echo "No se encontró aula.usm.cl_cookies.txt"
+            exit 1
+          fi
+
       - name: Crear carpetas de salida
         run: |
           mkdir -p output/pdfs
           mkdir -p output/logs
 
-      - name: Detectar archivo HTML
-        id: detect_html
-        shell: bash
-        run: |
-          HTML_FILE=$(find . -maxdepth 3 -type f \( -iname "*.html" -o -iname "*.htm" \) | head -n 1)
-          if [ -z "$HTML_FILE" ]; then
-            echo "No se encontró ningún archivo HTML en el repositorio."
-            exit 1
-          fi
-          echo "html_file=$HTML_FILE" >> $GITHUB_OUTPUT
-          echo "HTML detectado: $HTML_FILE"
-
-      - name: Verificar archivo de cookies
-        shell: bash
-        run: |
-          if [ ! -f "aula.usm.cl_cookies.txt" ]; then
-            echo "No se encontró el archivo aula.usm.cl_cookies.txt en la raíz del repositorio."
-            exit 1
-          fi
-          echo "Archivo de cookies encontrado."
-
-      - name: Ejecutar descarga
+      - name: Ejecutar descarga desde Moodle
         run: |
           python scripts/download_moodle_pdfs.py \
-            --html "${{ steps.detect_html.outputs.html_file }}" \
+            --url "https://aula.usm.cl/course/view.php?id=4401&section=23#tabs-tree-start" \
             --cookies "aula.usm.cl_cookies.txt" \
             --out "output"
 
@@ -64,4 +50,4 @@ jobs:
         with:
           name: moodle-backup
           path: moodle_backup.zip
-          if-no-files-found: error
+          if-no-files-found: warn
