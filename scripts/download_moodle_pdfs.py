@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Descarga PDFs autenticados desde una URL de Moodle usando cookies Netscape."""
+"""Descarga PDFs desde Moodle usando cookies Netscape, pensado para ejecución local."""
 
 from __future__ import annotations
 
@@ -12,15 +12,15 @@ import re
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 from urllib.parse import unquote, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
 
 REQUEST_TIMEOUT = (10, 90)
-USER_AGENT = "moodle-pdf-downloader/2.0"
-MOODLE_PATTERNS = (
+USER_AGENT = "moodle-pdf-downloader-local/3.0"
+PDF_CANDIDATE_PATTERNS = (
     "mod/resource/view.php",
     "mod/folder/view.php",
     "mod/url/view.php",
@@ -32,15 +32,15 @@ MOODLE_PATTERNS = (
 class LinkItem:
     url: str
     text: str
-    category: str
+    link_type: str
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Descargar PDFs desde Moodle autenticado")
-    parser.add_argument("--url", required=True, help="URL Moodle a analizar")
-    parser.add_argument("--cookies", required=True, help="Archivo cookies Netscape")
-    parser.add_argument("--out", required=True, help="Carpeta de salida")
-    parser.add_argument("--verbose", action="store_true", help="Logs detallados")
+    parser.add_argument("--url", required=True, help="URL del curso o sección de Moodle")
+    parser.add_argument("--cookies", required=True, help="Ruta a cookies Netscape exportadas")
+    parser.add_argument("--out", required=True, help="Carpeta de salida (crea pdfs/ y logs/)")
+    parser.add_argument("--verbose", action="store_true", help="Activa logs detallados")
     return parser.parse_args()
 
 
@@ -65,22 +65,7 @@ def ensure_dirs(out_dir: Path) -> Tuple[Path, Path]:
     return pdf_root, logs_root
 
 
-def classify(url: str) -> str:
-    lower = url.lower()
-    if "mod/folder/view.php" in lower:
-        return "folder_view"
-    if "mod/resource/view.php" in lower:
-        return "resource_view"
-    if "mod/url/view.php" in lower:
-        return "url_view"
-    if "pluginfile.php" in lower:
-        return "pluginfile"
-    if lower.endswith(".pdf"):
-        return "pdf_direct"
-    return "other"
-
-
-def load_cookies(cookies_file: Path) -> requests.cookies.RequestsCookieJar:
+def load_cookies_netscape(cookies_file: Path) -> requests.cookies.RequestsCookieJar:
     if not cookies_file.exists():
         raise FileNotFoundError(f"No existe archivo de cookies: {cookies_file}")
 
@@ -92,11 +77,13 @@ def load_cookies(cookies_file: Path) -> requests.cookies.RequestsCookieJar:
         parts = line.split("\t")
         if len(parts) < 7:
             continue
+
         domain, _flag, path, secure, _expiry, name, value = parts[:7]
+        domain = domain.lstrip(".")
         jar.set(name, value, domain=domain, path=path, secure=(secure.upper() == "TRUE"))
 
     if not jar:
-        raise ValueError("No se pudieron cargar cookies Netscape")
+        raise ValueError("Archivo de cookies vacío o no compatible con formato Netscape")
     return jar
 
 
@@ -107,50 +94,85 @@ def build_session(cookie_jar: requests.cookies.RequestsCookieJar) -> requests.Se
     return session
 
 
-def request_url(session: requests.Session, url: str, stream: bool = False) -> requests.Response:
-    return session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True, stream=stream)
+def classify_url(url: str) -> str:
+    low = url.lower()
+    if "mod/resource/view.php" in low:
+        return "mod/resource/view.php"
+    if "mod/folder/view.php" in low:
+        return "mod/folder/view.php"
+    if "mod/url/view.php" in low:
+        return "mod/url/view.php"
+    if "pluginfile.php" in low:
+        return "pluginfile.php"
+    if low.endswith(".pdf") or ".pdf?" in low:
+        return "pdf_direct"
+    return "other"
 
 
-def is_login_response(resp: requests.Response) -> bool:
-    urls = [h.url for h in resp.history] + [resp.url]
-    for candidate in urls:
-        parsed = urlparse(candidate)
-        lower = candidate.lower()
-        if "login/index.php" in lower:
-            return True
-        if parsed.path.lower().endswith("/login/") or parsed.path.lower().startswith("/login"):
-            return True
+def detect_login_issue(resp: requests.Response) -> Optional[str]:
+    redirect_chain = [h.url for h in resp.history] + [resp.url]
+    lowered = [u.lower() for u in redirect_chain]
+
+    if any("/login/index.php" in u for u in lowered):
+        return "redirect_login_index"
+    if any("/auth/oauth2/login.php" in u for u in lowered):
+        return "redirect_oauth2_login"
+
     ctype = resp.headers.get("Content-Type", "").lower()
     if "text/html" in ctype:
-        html = resp.text[:12000].lower()
-        if "login" in html and ("username" in html or "password" in html or "acceder" in html):
-            return True
-    return False
+        html = resp.text[:20000].lower()
+        login_tokens = ["login", "acceder", "iniciar sesi", "username", "password", "oauth2"]
+        if sum(token in html for token in login_tokens) >= 2:
+            return "login_html_detected"
+
+    return None
 
 
-def extract_links(html: str, base_url: str) -> List[LinkItem]:
+def request_get(session: requests.Session, url: str, stream: bool = False) -> requests.Response:
+    return session.get(url, allow_redirects=True, timeout=REQUEST_TIMEOUT, stream=stream)
+
+
+def extract_candidate_links(html: str, base_url: str) -> List[LinkItem]:
     soup = BeautifulSoup(html, "lxml")
-    found: List[LinkItem] = []
+    links: List[LinkItem] = []
     seen: Set[str] = set()
 
     for a in soup.find_all("a", href=True):
         href = a.get("href", "").strip()
-        if not href or href.lower().startswith(("javascript:", "mailto:", "#")):
+        if not href or href.startswith(("#", "javascript:", "mailto:")):
             continue
         full_url = urljoin(base_url, href)
-        lower = full_url.lower()
-        if not full_url.startswith(("http://", "https://")):
-            continue
-        if not any(token in lower for token in MOODLE_PATTERNS) and not lower.endswith(".pdf"):
-            continue
         if full_url in seen:
             continue
+        low = full_url.lower()
+        if not full_url.startswith(("http://", "https://")):
+            continue
+        if not any(p in low for p in PDF_CANDIDATE_PATTERNS) and not low.endswith(".pdf") and ".pdf?" not in low:
+            continue
+
         seen.add(full_url)
-
         text = a.get_text(" ", strip=True) or Path(urlparse(full_url).path).name or "recurso"
-        found.append(LinkItem(url=full_url, text=sanitize_name(text, "recurso"), category=classify(full_url)))
+        links.append(LinkItem(url=full_url, text=sanitize_name(text, "recurso"), link_type=classify_url(full_url)))
 
-    return found
+    return links
+
+
+def extract_pdf_links_from_html(html: str, base_url: str) -> List[LinkItem]:
+    soup = BeautifulSoup(html, "lxml")
+    out: List[LinkItem] = []
+    seen: Set[str] = set()
+
+    for a in soup.find_all("a", href=True):
+        full_url = urljoin(base_url, a.get("href", "").strip())
+        low = full_url.lower()
+        if full_url in seen:
+            continue
+        if "pluginfile.php" in low or low.endswith(".pdf") or ".pdf?" in low:
+            seen.add(full_url)
+            text = a.get_text(" ", strip=True) or Path(urlparse(full_url).path).name or "pdf"
+            out.append(LinkItem(url=full_url, text=sanitize_name(text, "pdf"), link_type=classify_url(full_url)))
+
+    return out
 
 
 def filename_from_response(resp: requests.Response, fallback: str) -> str:
@@ -166,56 +188,34 @@ def filename_from_response(resp: requests.Response, fallback: str) -> str:
             filename = unquote(match.group(1).strip())
 
     if not filename:
-        filename = Path(urlparse(resp.url).path).name
-    if not filename:
-        filename = f"{sanitize_name(fallback, 'archivo')}.pdf"
+        filename = Path(urlparse(resp.url).path).name or f"{sanitize_name(fallback, 'archivo')}.pdf"
 
     filename = sanitize_name(filename, "archivo.pdf")
     if not filename.lower().endswith(".pdf"):
-        filename = f"{filename}.pdf"
+        filename += ".pdf"
     return filename
 
 
-def pdf_signature(head_bytes: bytes) -> bool:
-    return head_bytes.startswith(b"%PDF-")
-
-
-def is_pdf_response(resp: requests.Response, head_bytes: bytes) -> bool:
+def is_pdf_response(resp: requests.Response, first_chunk: bytes) -> bool:
     ctype = resp.headers.get("Content-Type", "").lower()
-    cdisp = resp.headers.get("Content-Disposition", "").lower()
-    final_url = resp.url.lower()
+    disp = resp.headers.get("Content-Disposition", "").lower()
+    low_url = resp.url.lower()
 
-    if "application/pdf" in ctype:
-        return True
-    if "filename=" in cdisp and ".pdf" in cdisp:
-        return True
-    if final_url.endswith(".pdf") or ".pdf?" in final_url:
-        return True
-    if pdf_signature(head_bytes):
-        return True
-    return False
+    return (
+        "application/pdf" in ctype
+        or ".pdf" in disp
+        or low_url.endswith(".pdf")
+        or ".pdf?" in low_url
+        or first_chunk.startswith(b"%PDF-")
+    )
 
 
-def parse_folder_pdf_links(html: str, base_url: str) -> List[LinkItem]:
-    soup = BeautifulSoup(html, "lxml")
-    links: List[LinkItem] = []
-    seen: Set[str] = set()
-
-    for a in soup.find_all("a", href=True):
-        href = a.get("href", "").strip()
-        if not href:
-            continue
-        full = urljoin(base_url, href)
-        lower = full.lower()
-        if "pluginfile.php" not in lower and not lower.endswith(".pdf"):
-            continue
-        if full in seen:
-            continue
-        seen.add(full)
-        text = a.get_text(" ", strip=True) or Path(urlparse(full).path).name or "pdf"
-        links.append(LinkItem(url=full, text=sanitize_name(text, "pdf"), category="pluginfile"))
-
-    return links
+def compute_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def unique_path(path: Path) -> Path:
@@ -229,78 +229,79 @@ def unique_path(path: Path) -> Path:
         idx += 1
 
 
-def compute_hash(path: Path) -> str:
-    sha = hashlib.sha256()
-    with path.open("rb") as handle:
-        while True:
-            chunk = handle.read(1024 * 1024)
-            if not chunk:
-                break
-            sha.update(chunk)
-    return sha.hexdigest()
+def console_report(url: str, link_type: str, status: str, final_url: str, content_type: str, reason: str) -> None:
+    print(
+        f"url_original={url} | tipo={link_type} | http_status={status} | final_url={final_url} | "
+        f"content_type={content_type or '-'} | reason={reason}"
+    )
 
 
-def download_pdf_response(
+def download_pdf(
     resp: requests.Response,
     target_dir: Path,
     fallback_name: str,
-    seen_hashes: Set[str],
-    seen_urls: Set[str],
-    seen_names: Set[str],
+    known_hashes: Set[str],
 ) -> Tuple[str, str]:
-    final_url = resp.url
-    if final_url in seen_urls:
-        return "", "duplicate"
+    filename = filename_from_response(resp, fallback_name)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    out_path = unique_path(target_dir / filename)
 
-    head_bytes = b""
-    temp_path: Optional[Path] = None
-    try:
-        filename = filename_from_response(resp, fallback_name)
-        target_dir.mkdir(parents=True, exist_ok=True)
-        temp_path = unique_path(target_dir / filename)
+    first_chunk = b""
+    with out_path.open("wb") as fh:
+        for chunk in resp.iter_content(chunk_size=1024 * 256):
+            if not chunk:
+                continue
+            if not first_chunk:
+                first_chunk = chunk[:8]
+            fh.write(chunk)
 
-        with temp_path.open("wb") as out:
-            for chunk in resp.iter_content(chunk_size=1024 * 256):
-                if not chunk:
-                    continue
-                if not head_bytes:
-                    head_bytes = chunk[:8]
-                out.write(chunk)
+    if not first_chunk:
+        first_chunk = out_path.read_bytes()[:8]
 
-        if not head_bytes:
-            head_bytes = temp_path.read_bytes()[:8]
+    if not is_pdf_response(resp, first_chunk):
+        out_path.unlink(missing_ok=True)
+        return filename, "not_pdf_response"
 
-        if not is_pdf_response(resp, head_bytes):
-            temp_path.unlink(missing_ok=True)
-            return filename, "not_pdf"
+    digest = compute_sha256(out_path)
+    if digest in known_hashes:
+        out_path.unlink(missing_ok=True)
+        return filename, "duplicate_sha256"
 
-        digest = compute_hash(temp_path)
-        lname = filename.lower()
-        if digest in seen_hashes or lname in seen_names:
-            temp_path.unlink(missing_ok=True)
-            return filename, "duplicate"
-
-        seen_hashes.add(digest)
-        seen_urls.add(final_url)
-        seen_names.add(lname)
-        return filename, "downloaded"
-    finally:
-        resp.close()
+    known_hashes.add(digest)
+    return out_path.name, "downloaded"
 
 
-def write_logs(logs_root: Path, rows: List[Dict[str, str]], failed: List[Dict[str, str]], summary: Dict[str, int]) -> None:
-    with (logs_root / "download_log.csv").open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["url", "filename", "status", "http_status"])
+def write_logs(
+    logs_dir: Path,
+    download_rows: List[Dict[str, str]],
+    failed_rows: List[Dict[str, str]],
+    summary: Dict[str, int],
+) -> None:
+    download_log = logs_dir / "download_log.csv"
+    failed_log = logs_dir / "failed_urls.csv"
+    summary_file = logs_dir / "summary.json"
+
+    headers = ["url_original", "tipo", "http_status", "final_url", "content_type", "reason", "filename"]
+
+    with download_log.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=headers)
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(download_rows)
 
-    with (logs_root / "failed_urls.csv").open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["url", "filename", "status", "http_status"])
+    with failed_log.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=headers)
         writer.writeheader()
-        writer.writerows(failed)
+        writer.writerows(failed_rows)
 
-    with (logs_root / "summary.json").open("w", encoding="utf-8") as f:
-        json.dump(summary, f, ensure_ascii=False, indent=2)
+    with summary_file.open("w", encoding="utf-8") as fh:
+        json.dump(summary, fh, ensure_ascii=False, indent=2)
+
+
+def iter_links_with_nested(base_links: Iterable[LinkItem], nested_links: Dict[str, List[LinkItem]]) -> Iterable[LinkItem]:
+    for item in base_links:
+        yield item
+        for child in nested_links.get(item.url, []):
+            yield child
 
 
 def main() -> int:
@@ -308,13 +309,13 @@ def main() -> int:
     configure_logging(args.verbose)
 
     out_dir = Path(args.out)
-    cookies_file = Path(args.cookies)
-    pdf_root, logs_root = ensure_dirs(out_dir)
+    cookies_path = Path(args.cookies)
+    pdf_dir, logs_dir = ensure_dirs(out_dir)
 
-    log_rows: List[Dict[str, str]] = []
+    download_rows: List[Dict[str, str]] = []
     failed_rows: List[Dict[str, str]] = []
     summary = {
-        "total_links": 0,
+        "total_detected_links": 0,
         "processed_links": 0,
         "downloaded": 0,
         "duplicates": 0,
@@ -322,145 +323,303 @@ def main() -> int:
     }
 
     try:
-        cookie_jar = load_cookies(cookies_file)
+        cookie_jar = load_cookies_netscape(cookies_path)
     except Exception as exc:
-        logging.error("Error cargando cookies: %s", exc)
-        failed_rows.append({"url": args.url, "filename": "", "status": "cookies_error", "http_status": ""})
+        logging.error("No se pudieron cargar cookies: %s", exc)
+        failed_rows.append(
+            {
+                "url_original": args.url,
+                "tipo": "course_url",
+                "http_status": "-",
+                "final_url": "-",
+                "content_type": "-",
+                "reason": f"cookies_error:{exc}",
+                "filename": "",
+            }
+        )
         summary["failed"] += 1
-        write_logs(logs_root, log_rows, failed_rows, summary)
+        write_logs(logs_dir, download_rows, failed_rows, summary)
         return 1
 
     session = build_session(cookie_jar)
 
     try:
-        page = request_url(session, args.url, stream=False)
+        course_resp = request_get(session, args.url, stream=False)
     except Exception as exc:
-        logging.error("Error solicitando URL base: %s", exc)
-        failed_rows.append({"url": args.url, "filename": "", "status": "request_error", "http_status": ""})
+        logging.error("No se pudo abrir URL base: %s", exc)
+        failed_rows.append(
+            {
+                "url_original": args.url,
+                "tipo": "course_url",
+                "http_status": "-",
+                "final_url": "-",
+                "content_type": "-",
+                "reason": f"request_error:{exc}",
+                "filename": "",
+            }
+        )
         summary["failed"] += 1
-        write_logs(logs_root, log_rows, failed_rows, summary)
+        write_logs(logs_dir, download_rows, failed_rows, summary)
         return 1
 
-    if page.status_code >= 400:
-        failed_rows.append({"url": args.url, "filename": "", "status": "http_error", "http_status": str(page.status_code)})
+    login_issue = detect_login_issue(course_resp)
+    if login_issue:
+        reason = f"auth_failed:{login_issue}"
+        console_report(args.url, "course_url", str(course_resp.status_code), course_resp.url, course_resp.headers.get("Content-Type", ""), reason)
+        failed_rows.append(
+            {
+                "url_original": args.url,
+                "tipo": "course_url",
+                "http_status": str(course_resp.status_code),
+                "final_url": course_resp.url,
+                "content_type": course_resp.headers.get("Content-Type", ""),
+                "reason": reason,
+                "filename": "",
+            }
+        )
         summary["failed"] += 1
-        write_logs(logs_root, log_rows, failed_rows, summary)
+        write_logs(logs_dir, download_rows, failed_rows, summary)
         return 1
 
-    if is_login_response(page):
-        failed_rows.append({"url": args.url, "filename": "", "status": "login_redirect", "http_status": str(page.status_code)})
-        summary["failed"] += 1
-        write_logs(logs_root, log_rows, failed_rows, summary)
-        return 1
+    course_links = extract_candidate_links(course_resp.text, course_resp.url)
+    summary["total_detected_links"] = len(course_links)
+    logging.info("Links detectados en curso: %s", len(course_links))
 
-    links = extract_links(page.text, page.url)
-    summary["total_links"] = len(links)
-    logging.info("Enlaces candidatos detectados: %d", len(links))
+    known_hashes: Set[str] = set()
+    seen_urls: Set[str] = set()
 
-    seen_source_urls: Set[str] = set()
-    seen_final_urls: Set[str] = set()
-    seen_hashes: Set[str] = set()
-    seen_names: Set[str] = set()
-
-    for item in links:
-        if item.url in seen_source_urls:
-            log_rows.append({"url": item.url, "filename": "", "status": "duplicate", "http_status": ""})
-            summary["duplicates"] += 1
-            continue
-        seen_source_urls.add(item.url)
+    for link in course_links:
         summary["processed_links"] += 1
-
-        if item.category == "folder_view":
-            folder_name = sanitize_name(item.text, "folder")
-            folder_dir = pdf_root / folder_name
-            try:
-                folder_resp = request_url(session, item.url, stream=False)
-            except Exception:
-                log_rows.append({"url": item.url, "filename": "", "status": "failed", "http_status": ""})
-                failed_rows.append({"url": item.url, "filename": "", "status": "request_error", "http_status": ""})
-                summary["failed"] += 1
-                continue
-
-            if folder_resp.status_code >= 400 or is_login_response(folder_resp):
-                log_rows.append({"url": item.url, "filename": "", "status": "failed", "http_status": str(folder_resp.status_code)})
-                failed_rows.append({"url": item.url, "filename": "", "status": "login_or_http_error", "http_status": str(folder_resp.status_code)})
-                summary["failed"] += 1
-                continue
-
-            nested_links = parse_folder_pdf_links(folder_resp.text, folder_resp.url)
-            if not nested_links:
-                log_rows.append({"url": item.url, "filename": "", "status": "failed", "http_status": str(folder_resp.status_code)})
-                failed_rows.append({"url": item.url, "filename": "", "status": "no_pdf_in_folder", "http_status": str(folder_resp.status_code)})
-                summary["failed"] += 1
-                continue
-
-            for nested in nested_links:
-                try:
-                    pdf_resp = request_url(session, nested.url, stream=True)
-                except Exception:
-                    log_rows.append({"url": nested.url, "filename": "", "status": "failed", "http_status": ""})
-                    failed_rows.append({"url": nested.url, "filename": "", "status": "request_error", "http_status": ""})
-                    summary["failed"] += 1
-                    continue
-
-                if pdf_resp.status_code >= 400 or is_login_response(pdf_resp):
-                    log_rows.append({"url": nested.url, "filename": "", "status": "failed", "http_status": str(pdf_resp.status_code)})
-                    failed_rows.append({"url": nested.url, "filename": "", "status": "login_or_http_error", "http_status": str(pdf_resp.status_code)})
-                    summary["failed"] += 1
-                    pdf_resp.close()
-                    continue
-
-                filename, status = download_pdf_response(
-                    pdf_resp,
-                    folder_dir,
-                    nested.text,
-                    seen_hashes,
-                    seen_final_urls,
-                    seen_names,
-                )
-                log_rows.append({"url": nested.url, "filename": filename, "status": status, "http_status": str(pdf_resp.status_code)})
-                if status == "downloaded":
-                    summary["downloaded"] += 1
-                elif status == "duplicate":
-                    summary["duplicates"] += 1
-                else:
-                    failed_rows.append({"url": nested.url, "filename": filename, "status": status, "http_status": str(pdf_resp.status_code)})
-                    summary["failed"] += 1
+        if link.url in seen_urls:
+            summary["duplicates"] += 1
+            reason = "duplicate_input_url"
+            console_report(link.url, link.link_type, "-", "-", "-", reason)
+            row = {
+                "url_original": link.url,
+                "tipo": link.link_type,
+                "http_status": "-",
+                "final_url": "-",
+                "content_type": "-",
+                "reason": reason,
+                "filename": "",
+            }
+            download_rows.append(row)
             continue
+
+        seen_urls.add(link.url)
 
         try:
-            resp = request_url(session, item.url, stream=True)
-        except Exception:
-            log_rows.append({"url": item.url, "filename": "", "status": "failed", "http_status": ""})
-            failed_rows.append({"url": item.url, "filename": "", "status": "request_error", "http_status": ""})
+            resp = request_get(session, link.url, stream=True)
+        except Exception as exc:
             summary["failed"] += 1
+            reason = f"request_error:{exc}"
+            console_report(link.url, link.link_type, "-", "-", "-", reason)
+            fail = {
+                "url_original": link.url,
+                "tipo": link.link_type,
+                "http_status": "-",
+                "final_url": "-",
+                "content_type": "-",
+                "reason": reason,
+                "filename": "",
+            }
+            download_rows.append(fail)
+            failed_rows.append(fail)
             continue
 
-        if resp.status_code >= 400 or is_login_response(resp):
-            log_rows.append({"url": item.url, "filename": "", "status": "failed", "http_status": str(resp.status_code)})
-            failed_rows.append({"url": item.url, "filename": "", "status": "login_or_http_error", "http_status": str(resp.status_code)})
+        status = str(resp.status_code)
+        final_url = resp.url
+        ctype = resp.headers.get("Content-Type", "")
+
+        login_issue = detect_login_issue(resp)
+        if login_issue:
             summary["failed"] += 1
+            reason = f"auth_failed:{login_issue}"
+            console_report(link.url, link.link_type, status, final_url, ctype, reason)
+            fail = {
+                "url_original": link.url,
+                "tipo": link.link_type,
+                "http_status": status,
+                "final_url": final_url,
+                "content_type": ctype,
+                "reason": reason,
+                "filename": "",
+            }
+            download_rows.append(fail)
+            failed_rows.append(fail)
             resp.close()
             continue
 
-        filename, status = download_pdf_response(resp, pdf_root, item.text, seen_hashes, seen_final_urls, seen_names)
-        log_rows.append({"url": item.url, "filename": filename, "status": status, "http_status": str(resp.status_code)})
-        if status == "downloaded":
+        if resp.status_code >= 400:
+            summary["failed"] += 1
+            reason = "http_error"
+            console_report(link.url, link.link_type, status, final_url, ctype, reason)
+            fail = {
+                "url_original": link.url,
+                "tipo": link.link_type,
+                "http_status": status,
+                "final_url": final_url,
+                "content_type": ctype,
+                "reason": reason,
+                "filename": "",
+            }
+            download_rows.append(fail)
+            failed_rows.append(fail)
+            resp.close()
+            continue
+
+        should_parse_html = "text/html" in ctype.lower() or link.link_type in {
+            "mod/folder/view.php",
+            "mod/resource/view.php",
+            "mod/url/view.php",
+        }
+
+        if should_parse_html:
+            html_text = resp.text
+            resp.close()
+            nested_pdf_links = extract_pdf_links_from_html(html_text, final_url)
+            if not nested_pdf_links:
+                summary["failed"] += 1
+                reason = "html_without_pdf_links"
+                console_report(link.url, link.link_type, status, final_url, ctype, reason)
+                fail = {
+                    "url_original": link.url,
+                    "tipo": link.link_type,
+                    "http_status": status,
+                    "final_url": final_url,
+                    "content_type": ctype,
+                    "reason": reason,
+                    "filename": "",
+                }
+                download_rows.append(fail)
+                failed_rows.append(fail)
+                continue
+
+            reason = f"html_with_{len(nested_pdf_links)}_pdf_links"
+            console_report(link.url, link.link_type, status, final_url, ctype, reason)
+            download_rows.append(
+                {
+                    "url_original": link.url,
+                    "tipo": link.link_type,
+                    "http_status": status,
+                    "final_url": final_url,
+                    "content_type": ctype,
+                    "reason": reason,
+                    "filename": "",
+                }
+            )
+
+            for nested in nested_pdf_links:
+                summary["processed_links"] += 1
+                if nested.url in seen_urls:
+                    summary["duplicates"] += 1
+                    reason = "duplicate_nested_url"
+                    console_report(nested.url, nested.link_type, "-", "-", "-", reason)
+                    download_rows.append(
+                        {
+                            "url_original": nested.url,
+                            "tipo": nested.link_type,
+                            "http_status": "-",
+                            "final_url": "-",
+                            "content_type": "-",
+                            "reason": reason,
+                            "filename": "",
+                        }
+                    )
+                    continue
+
+                seen_urls.add(nested.url)
+                try:
+                    nested_resp = request_get(session, nested.url, stream=True)
+                except Exception as exc:
+                    summary["failed"] += 1
+                    reason = f"request_error:{exc}"
+                    console_report(nested.url, nested.link_type, "-", "-", "-", reason)
+                    fail = {
+                        "url_original": nested.url,
+                        "tipo": nested.link_type,
+                        "http_status": "-",
+                        "final_url": "-",
+                        "content_type": "-",
+                        "reason": reason,
+                        "filename": "",
+                    }
+                    download_rows.append(fail)
+                    failed_rows.append(fail)
+                    continue
+
+                nested_login = detect_login_issue(nested_resp)
+                nested_status = str(nested_resp.status_code)
+                nested_final = nested_resp.url
+                nested_ctype = nested_resp.headers.get("Content-Type", "")
+                if nested_login or nested_resp.status_code >= 400:
+                    summary["failed"] += 1
+                    reason = f"auth_failed:{nested_login}" if nested_login else "http_error"
+                    console_report(nested.url, nested.link_type, nested_status, nested_final, nested_ctype, reason)
+                    fail = {
+                        "url_original": nested.url,
+                        "tipo": nested.link_type,
+                        "http_status": nested_status,
+                        "final_url": nested_final,
+                        "content_type": nested_ctype,
+                        "reason": reason,
+                        "filename": "",
+                    }
+                    download_rows.append(fail)
+                    failed_rows.append(fail)
+                    nested_resp.close()
+                    continue
+
+                filename, dl_status = download_pdf(nested_resp, pdf_dir, nested.text, known_hashes)
+                nested_resp.close()
+                if dl_status == "downloaded":
+                    summary["downloaded"] += 1
+                elif dl_status.startswith("duplicate"):
+                    summary["duplicates"] += 1
+                else:
+                    summary["failed"] += 1
+
+                console_report(nested.url, nested.link_type, nested_status, nested_final, nested_ctype, dl_status)
+                row = {
+                    "url_original": nested.url,
+                    "tipo": nested.link_type,
+                    "http_status": nested_status,
+                    "final_url": nested_final,
+                    "content_type": nested_ctype,
+                    "reason": dl_status,
+                    "filename": filename,
+                }
+                download_rows.append(row)
+                if dl_status != "downloaded" and not dl_status.startswith("duplicate"):
+                    failed_rows.append(row)
+            continue
+
+        filename, dl_status = download_pdf(resp, pdf_dir, link.text, known_hashes)
+        resp.close()
+
+        if dl_status == "downloaded":
             summary["downloaded"] += 1
-        elif status == "duplicate":
+        elif dl_status.startswith("duplicate"):
             summary["duplicates"] += 1
         else:
-            failed_rows.append({"url": item.url, "filename": filename, "status": status, "http_status": str(resp.status_code)})
             summary["failed"] += 1
 
-    write_logs(logs_root, log_rows, failed_rows, summary)
-    logging.info(
-        "Procesados=%s Descargados=%s Duplicados=%s Fallidos=%s",
-        summary["processed_links"],
-        summary["downloaded"],
-        summary["duplicates"],
-        summary["failed"],
-    )
+        console_report(link.url, link.link_type, status, final_url, ctype, dl_status)
+        row = {
+            "url_original": link.url,
+            "tipo": link.link_type,
+            "http_status": status,
+            "final_url": final_url,
+            "content_type": ctype,
+            "reason": dl_status,
+            "filename": filename,
+        }
+        download_rows.append(row)
+        if dl_status != "downloaded" and not dl_status.startswith("duplicate"):
+            failed_rows.append(row)
+
+    write_logs(logs_dir, download_rows, failed_rows, summary)
+    logging.info("Resumen: %s", json.dumps(summary, ensure_ascii=False))
     return 0
 
 
