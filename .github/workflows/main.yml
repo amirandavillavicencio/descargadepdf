@@ -1,35 +1,14 @@
-name: Respaldo Moodle PDFs
+name: Descargar PDFs Moodle
 
 on:
   workflow_dispatch:
-    inputs:
-      html_file:
-        description: "Ruta del HTML dentro del repo"
-        required: true
-        default: "html/curso_exportado.html"
-      output_dir:
-        description: "Carpeta de salida"
-        required: true
-        default: "output"
-      delay:
-        description: "Delay entre requests en segundos"
-        required: true
-        default: "0.4"
-      only_pdf:
-        description: "Descargar solo PDFs directos (true/false)"
-        required: true
-        default: "false"
-
-permissions:
-  contents: read
 
 jobs:
   backup-pdfs:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
 
     steps:
-      - name: Checkout del repositorio
+      - name: Clonar repositorio
         uses: actions/checkout@v4
 
       - name: Configurar Python 3.11
@@ -42,57 +21,47 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Validar secret y archivos de entrada
-        env:
-          MOODLE_COOKIES: ${{ secrets.MOODLE_COOKIES }}
+      - name: Crear carpetas de salida
         run: |
-          set -euo pipefail
-          if [ -z "${MOODLE_COOKIES:-}" ]; then
-            echo "ERROR: Falta el secret MOODLE_COOKIES" >&2
-            exit 1
-          fi
-          if [ ! -f "${{ github.event.inputs.html_file }}" ]; then
-            echo "ERROR: No existe el HTML indicado: ${{ github.event.inputs.html_file }}" >&2
-            exit 1
-          fi
-          if [ ! -f "scripts/download_moodle_pdfs.py" ]; then
-            echo "ERROR: Falta scripts/download_moodle_pdfs.py" >&2
-            exit 1
-          fi
+          mkdir -p output/pdfs
+          mkdir -p output/logs
 
-      - name: Ejecutar respaldo
-        env:
-          MOODLE_COOKIES: ${{ secrets.MOODLE_COOKIES }}
+      - name: Detectar archivo HTML
+        id: detect_html
+        shell: bash
         run: |
-          set -euo pipefail
-          mkdir -p "${{ github.event.inputs.output_dir }}"
-          EXTRA=""
-          if [ "${{ github.event.inputs.only_pdf }}" = "true" ]; then
-            EXTRA="--only-pdf"
+          HTML_FILE=$(find . -maxdepth 3 -type f \( -iname "*.html" -o -iname "*.htm" \) | head -n 1)
+          if [ -z "$HTML_FILE" ]; then
+            echo "No se encontró ningún archivo HTML en el repositorio."
+            exit 1
           fi
+          echo "html_file=$HTML_FILE" >> $GITHUB_OUTPUT
+          echo "HTML detectado: $HTML_FILE"
 
+      - name: Verificar archivo de cookies
+        shell: bash
+        run: |
+          if [ ! -f "aula.usm.cl_cookies.txt" ]; then
+            echo "No se encontró el archivo aula.usm.cl_cookies.txt en la raíz del repositorio."
+            exit 1
+          fi
+          echo "Archivo de cookies encontrado."
+
+      - name: Ejecutar descarga
+        run: |
           python scripts/download_moodle_pdfs.py \
-            --html "${{ github.event.inputs.html_file }}" \
-            --out "${{ github.event.inputs.output_dir }}" \
-            --delay "${{ github.event.inputs.delay }}" \
-            --max-workers 6 \
-            ${EXTRA}
+            --html "${{ steps.detect_html.outputs.html_file }}" \
+            --cookies "aula.usm.cl_cookies.txt" \
+            --out "output"
 
-      - name: Comprimir salida
+      - name: Comprimir resultados
         run: |
-          set -euo pipefail
-          zip -r respaldo_moodle.zip "${{ github.event.inputs.output_dir }}"
+          cd output
+          zip -r ../moodle_backup.zip .
 
       - name: Subir ZIP como artifact
         uses: actions/upload-artifact@v4
         with:
-          name: respaldo-moodle-zip
-          path: respaldo_moodle.zip
-          if-no-files-found: error
-
-      - name: Subir carpeta output como artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: respaldo-moodle-output
-          path: ${{ github.event.inputs.output_dir }}
+          name: moodle-backup
+          path: moodle_backup.zip
           if-no-files-found: error
