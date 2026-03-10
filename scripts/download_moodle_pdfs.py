@@ -26,6 +26,20 @@ PDF_CANDIDATE_PATTERNS = (
     "mod/url/view.php",
     "pluginfile.php",
 )
+INTENSIVOS_TABS = [
+    "Matemática I",
+    "Matemática II",
+    "Matemática III",
+    "Matemática IV",
+    "Física 100",
+    "Física 110",
+    "Física 120",
+    "Física 130",
+    "Química",
+    "Programación",
+    "CIAC",
+]
+HISTORICAL_YEARS = {"2020", "2021", "2022", "2023", "2024"}
 
 
 @dataclass
@@ -40,6 +54,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--url", required=True, help="URL del curso o sección de Moodle")
     parser.add_argument("--cookies", required=True, help="Ruta a cookies Netscape exportadas")
     parser.add_argument("--out", required=True, help="Carpeta de salida (crea pdfs/ y logs/)")
+    parser.add_argument(
+        "--intensivos-ciac",
+        action="store_true",
+        help="Recorre sub-solapas de INTENSIVOS CIAC y prioriza 'Descargar carpeta' en carpetas históricas 2020-2024",
+    )
     parser.add_argument("--verbose", action="store_true", help="Activa logs detallados")
     return parser.parse_args()
 
@@ -59,10 +78,18 @@ def sanitize_name(value: str, fallback: str = "archivo") -> str:
 
 def ensure_dirs(out_dir: Path) -> Tuple[Path, Path]:
     pdf_root = out_dir / "pdfs"
+    zip_root = out_dir / "zips"
     logs_root = out_dir / "logs"
     pdf_root.mkdir(parents=True, exist_ok=True)
+    zip_root.mkdir(parents=True, exist_ok=True)
     logs_root.mkdir(parents=True, exist_ok=True)
-    return pdf_root, logs_root
+    return pdf_root, zip_root, logs_root
+
+
+def normalize_text(value: str) -> str:
+    text = unicodedata.normalize("NFKD", value or "")
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    return re.sub(r"\s+", " ", text).strip().lower()
 
 
 def load_cookies_netscape(cookies_file: Path) -> requests.cookies.RequestsCookieJar:
@@ -155,6 +182,55 @@ def extract_candidate_links(html: str, base_url: str) -> List[LinkItem]:
         links.append(LinkItem(url=full_url, text=sanitize_name(text, "recurso"), link_type=classify_url(full_url)))
 
     return links
+
+
+def extract_tab_links(html: str, base_url: str) -> Dict[str, str]:
+    soup = BeautifulSoup(html, "lxml")
+    wanted = {normalize_text(name): name for name in INTENSIVOS_TABS}
+    found: Dict[str, str] = {}
+
+    for a in soup.find_all("a", href=True):
+        label = a.get_text(" ", strip=True)
+        key = normalize_text(label)
+        if key in wanted and wanted[key] not in found:
+            found[wanted[key]] = urljoin(base_url, a["href"].strip())
+
+    return found
+
+
+def extract_historical_folder_links(html: str, base_url: str) -> List[LinkItem]:
+    soup = BeautifulSoup(html, "lxml")
+    links: List[LinkItem] = []
+    seen: Set[str] = set()
+
+    for a in soup.find_all("a", href=True):
+        href = a.get("href", "").strip()
+        if not href:
+            continue
+        full_url = urljoin(base_url, href)
+        if "mod/folder/view.php" not in full_url.lower() or full_url in seen:
+            continue
+
+        text = a.get_text(" ", strip=True)
+        haystack = f"{text} {full_url}"
+        if not any(year in haystack for year in HISTORICAL_YEARS):
+            continue
+
+        seen.add(full_url)
+        links.append(LinkItem(url=full_url, text=sanitize_name(text, "carpeta"), link_type="mod/folder/view.php"))
+
+    return links
+
+
+def find_download_folder_url(html: str, base_url: str) -> Optional[str]:
+    soup = BeautifulSoup(html, "lxml")
+    for a in soup.find_all("a", href=True):
+        href = a.get("href", "").strip()
+        text = normalize_text(a.get_text(" ", strip=True))
+        full_url = urljoin(base_url, href)
+        if "download_folder.php" in full_url.lower() or "descargar carpeta" in text:
+            return full_url
+    return None
 
 
 def extract_pdf_links_from_html(html: str, base_url: str) -> List[LinkItem]:
@@ -271,6 +347,39 @@ def download_pdf(
     return out_path.name, "downloaded"
 
 
+def download_zip(
+    resp: requests.Response,
+    target_dir: Path,
+    fallback_name: str,
+    known_hashes: Set[str],
+) -> Tuple[str, str]:
+    filename = filename_from_response(resp, fallback_name)
+    if filename.lower().endswith(".pdf"):
+        filename = f"{Path(filename).stem}.zip"
+    if not filename.lower().endswith(".zip"):
+        filename = f"{filename}.zip"
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    out_path = unique_path(target_dir / filename)
+    with out_path.open("wb") as fh:
+        for chunk in resp.iter_content(chunk_size=1024 * 256):
+            if chunk:
+                fh.write(chunk)
+
+    ctype = resp.headers.get("Content-Type", "").lower()
+    if "zip" not in ctype and out_path.stat().st_size == 0:
+        out_path.unlink(missing_ok=True)
+        return filename, "not_zip_response"
+
+    digest = compute_sha256(out_path)
+    if digest in known_hashes:
+        out_path.unlink(missing_ok=True)
+        return filename, "duplicate_sha256"
+
+    known_hashes.add(digest)
+    return out_path.name, "downloaded_zip"
+
+
 def write_logs(
     logs_dir: Path,
     download_rows: List[Dict[str, str]],
@@ -310,7 +419,7 @@ def main() -> int:
 
     out_dir = Path(args.out)
     cookies_path = Path(args.cookies)
-    pdf_dir, logs_dir = ensure_dirs(out_dir)
+    pdf_dir, zip_dir, logs_dir = ensure_dirs(out_dir)
 
     download_rows: List[Dict[str, str]] = []
     failed_rows: List[Dict[str, str]] = []
@@ -318,6 +427,7 @@ def main() -> int:
         "total_detected_links": 0,
         "processed_links": 0,
         "downloaded": 0,
+        "downloaded_zips": 0,
         "duplicates": 0,
         "failed": 0,
     }
@@ -381,7 +491,27 @@ def main() -> int:
         write_logs(logs_dir, download_rows, failed_rows, summary)
         return 1
 
-    course_links = extract_candidate_links(course_resp.text, course_resp.url)
+    if args.intensivos_ciac:
+        tab_links = extract_tab_links(course_resp.text, course_resp.url)
+        logging.info("Sub-solapas detectadas INTENSIVOS CIAC: %s", sorted(tab_links.keys()))
+        course_links: List[LinkItem] = []
+        for tab_name in INTENSIVOS_TABS:
+            if tab_name not in tab_links:
+                logging.warning("No se encontró sub-solapa: %s", tab_name)
+                continue
+            tab_url = tab_links[tab_name]
+            try:
+                tab_resp = request_get(session, tab_url, stream=False)
+            except Exception as exc:
+                logging.error("No se pudo abrir sub-solapa %s: %s", tab_name, exc)
+                continue
+            historical = extract_historical_folder_links(tab_resp.text, tab_resp.url)
+            for item in historical:
+                item.text = sanitize_name(f"{tab_name}_{item.text}", "carpeta")
+            course_links.extend(historical)
+    else:
+        course_links = extract_candidate_links(course_resp.text, course_resp.url)
+
     summary["total_detected_links"] = len(course_links)
     logging.info("Links detectados en curso: %s", len(course_links))
 
@@ -477,6 +607,74 @@ def main() -> int:
         if should_parse_html:
             html_text = resp.text
             resp.close()
+            if args.intensivos_ciac and link.link_type == "mod/folder/view.php":
+                download_folder_url = find_download_folder_url(html_text, final_url)
+                if download_folder_url and download_folder_url not in seen_urls:
+                    seen_urls.add(download_folder_url)
+                    summary["processed_links"] += 1
+                    try:
+                        zip_resp = request_get(session, download_folder_url, stream=True)
+                    except Exception as exc:
+                        summary["failed"] += 1
+                        reason = f"request_error:{exc}"
+                        console_report(download_folder_url, "download_folder", "-", "-", "-", reason)
+                        fail = {
+                            "url_original": download_folder_url,
+                            "tipo": "download_folder",
+                            "http_status": "-",
+                            "final_url": "-",
+                            "content_type": "-",
+                            "reason": reason,
+                            "filename": "",
+                        }
+                        download_rows.append(fail)
+                        failed_rows.append(fail)
+                        continue
+
+                    zip_status = str(zip_resp.status_code)
+                    zip_final = zip_resp.url
+                    zip_ctype = zip_resp.headers.get("Content-Type", "")
+                    if zip_resp.status_code >= 400:
+                        summary["failed"] += 1
+                        reason = "http_error"
+                        console_report(download_folder_url, "download_folder", zip_status, zip_final, zip_ctype, reason)
+                        fail = {
+                            "url_original": download_folder_url,
+                            "tipo": "download_folder",
+                            "http_status": zip_status,
+                            "final_url": zip_final,
+                            "content_type": zip_ctype,
+                            "reason": reason,
+                            "filename": "",
+                        }
+                        download_rows.append(fail)
+                        failed_rows.append(fail)
+                        zip_resp.close()
+                        continue
+
+                    filename, dl_status = download_zip(zip_resp, zip_dir, link.text, known_hashes)
+                    zip_resp.close()
+                    if dl_status == "downloaded_zip":
+                        summary["downloaded_zips"] += 1
+                    elif dl_status.startswith("duplicate"):
+                        summary["duplicates"] += 1
+                    else:
+                        summary["failed"] += 1
+
+                    console_report(download_folder_url, "download_folder", zip_status, zip_final, zip_ctype, dl_status)
+                    row = {
+                        "url_original": download_folder_url,
+                        "tipo": "download_folder",
+                        "http_status": zip_status,
+                        "final_url": zip_final,
+                        "content_type": zip_ctype,
+                        "reason": dl_status,
+                        "filename": filename,
+                    }
+                    download_rows.append(row)
+                    if dl_status in {"downloaded_zip", "duplicate_sha256"}:
+                        continue
+
             nested_pdf_links = extract_pdf_links_from_html(html_text, final_url)
             if not nested_pdf_links:
                 summary["failed"] += 1

@@ -39,6 +39,22 @@ bash scripts/run_local_example.sh
 python .\scripts\download_moodle_pdfs.py --url "https://aula.usm.cl/course/view.php?id=4401&section=23#tabs-tree-start" --cookies "aula.usm.cl_cookies.txt" --out "output"
 ```
 
+
+
+## Modo INTENSIVOS CIAC (descarga por carpeta)
+
+Para priorizar el botón **"Descargar carpeta"** en carpetas de años 2020-2024 dentro de sub-solapas de INTENSIVOS CIAC, usa:
+
+```bash
+python scripts/download_moodle_pdfs.py \
+  --url "https://aula.usm.cl/course/view.php?id=4401&section=23#tabs-tree-start" \
+  --cookies "aula.usm.cl_cookies.txt" \
+  --out "output_intensivos" \
+  --intensivos-ciac
+```
+
+Cuando una carpeta no expone el enlace de descarga ZIP, el script cae automáticamente a descarga manual de PDFs desde esa carpeta.
+
 ## Qué valida el script
 
 1. Carga cookies en formato Netscape desde `--cookies`.
